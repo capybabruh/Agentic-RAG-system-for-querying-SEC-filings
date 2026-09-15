@@ -11,4 +11,10 @@ export default defineConfig({
       '@': fileURLToPath(new URL('./src', import.meta.url)),
     },
   },
+  preview: {
+    // Railway's domain isn't known at build time (and can change), so allow
+    // any host rather than hardcoding one — the preview server sits behind
+    // Railway's own edge routing, not exposed as a general-purpose dev server.
+    allowedHosts: true,
+  },
 })
