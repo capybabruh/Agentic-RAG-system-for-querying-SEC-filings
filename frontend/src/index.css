@@ -1,0 +1,102 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+/* No dark-mode toggle exists — deliberately disable Tailwind's OS-preference-based
+   dark: variant (by pointing it at a class that's never applied) so the app stays a
+   consistent light theme regardless of the viewer's system setting. */
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  --background: #ffffff;
+  --foreground: #18181b;
+  --surface: #ffffff;
+  --surface-foreground: #18181b;
+  --muted: #f4f4f5;
+  --muted-foreground: #71717a;
+  --border: #e4e4e7;
+  --input: #e4e4e7;
+
+  /* Primary action color — solid ink, used for buttons (send, new chat). */
+  --ink: #18181b;
+  --ink-foreground: #ffffff;
+
+  /* The one deliberate accent in the system — reserved ONLY for citations,
+     never for buttons or generic UI state, so it stays the single thing
+     that reads as "verified." See Citations.tsx. */
+  --citation: #a9791f;
+  --citation-foreground: #ffffff;
+
+  --info: #5b7ca3;
+  --destructive: #dc2626;
+  --destructive-foreground: #ffffff;
+  --radius: 0.75rem;
+
+  --sans:
+    -apple-system, "Segoe UI", system-ui, Roboto, "Helvetica Neue", sans-serif;
+  --mono: ui-monospace, "SF Mono", Consolas, monospace;
+
+  color-scheme: light;
+  font: 14px/1.55 var(--sans);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+
+  --color-card: var(--surface);
+  --color-card-foreground: var(--surface-foreground);
+  --color-popover: var(--surface);
+  --color-popover-foreground: var(--surface-foreground);
+
+  --color-primary: var(--ink);
+  --color-primary-foreground: var(--ink-foreground);
+  --color-secondary: var(--muted);
+  --color-secondary-foreground: var(--foreground);
+
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  /* accent = shadcn's generic hover/focus highlight slot (menu items etc.) */
+  --color-accent: var(--muted);
+  --color-accent-foreground: var(--foreground);
+  --color-info: var(--info);
+  --color-citation: var(--citation);
+  --color-citation-foreground: var(--citation-foreground);
+
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ink);
+
+  --color-sidebar: var(--surface);
+  --color-sidebar-foreground: var(--foreground);
+  --color-sidebar-primary: var(--ink);
+  --color-sidebar-primary-foreground: var(--ink-foreground);
+  --color-sidebar-accent: var(--muted);
+  --color-sidebar-accent-foreground: var(--foreground);
+  --color-sidebar-border: var(--border);
+  --color-sidebar-ring: var(--ink);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+@layer base {
+  * {
+    border-color: var(--color-border);
+  }
+
+  body {
+    margin: 0;
+    min-height: 100svh;
+    background: var(--color-background);
+    color: var(--color-foreground);
+  }
+}

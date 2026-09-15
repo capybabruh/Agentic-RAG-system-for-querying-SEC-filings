@@ -24,7 +24,7 @@ flowchart LR
         db[(Postgres<br/>chats, documents, chunks<br/>pgvector + full-text)]
     end
 
-    openai[OpenAI<br/>LLM + embeddings]
+    mistral[Mistral<br/>LLM generation + embeddings]
     corpus[SEC filing corpus]
     ingestion[Ingestion pipeline<br/>download, parse, chunk, embed]
 
@@ -34,11 +34,11 @@ flowchart LR
     browser -->|chat request + JWT| backend
     backend -->|verify user| auth
     backend -->|retrieve passages<br/>persist chats + citations| db
-    backend -->|generate grounded answer| openai
+    backend -->|generate grounded answer<br/>embed query| mistral
     backend -->|stream answer + citations| browser
 
     corpus --> ingestion
-    ingestion -->|create embeddings| openai
+    ingestion -->|create embeddings| mistral
     ingestion -->|store documents + chunks| db
 ```
 
@@ -67,7 +67,7 @@ Backend:
 - FastAPI + Uvicorn
 - Pydantic v2 + pydantic-settings
 - PydanticAI for typed LLM orchestration
-- OpenAI SDK for generation and embeddings
+- Mistral SDK for both generation (`mistral-small-latest`) and embeddings (`mistral-embed`, 1024 dimensions) — no OpenAI dependency
 - Supabase Python client for server-side database access
 - SQLAlchemy models + Alembic migrations for schema management
 - Supabase `pgvector` for semantic search
@@ -82,7 +82,7 @@ Persistence:
 
 ## System Boundaries
 
-The frontend is responsible for user interaction, local UI state, and sending the authenticated user's request to the backend. It should never hold service-role credentials, run retrieval logic, call OpenAI directly, or write privileged records to Supabase.
+The frontend is responsible for user interaction, local UI state, and sending the authenticated user's request to the backend. It should never hold service-role credentials, run retrieval logic, call the LLM/embedding provider directly, or write privileged records to Supabase.
 
 The backend is responsible for request authorization, retrieval, prompt construction, LLM execution, citation validation, streaming responses, and durable persistence. It owns all privileged credentials and is the only service allowed to use the Supabase service-role key.
 
@@ -200,7 +200,7 @@ Retrieval and grounding remain independent from PydanticAI. This keeps ingestion
 
 Document Copilot uses hybrid retrieval:
 
-1. Embed the user's query with the configured OpenAI embedding model.
+1. Embed the user's query with the configured Mistral embedding model (the same model used at ingestion time, so query and stored vectors are comparable).
 2. Run a semantic search over `document_chunks.embedding` with `pgvector`.
 3. Run a lexical search over `document_chunks.search_vector` with Postgres full-text search.
 4. Fuse the two ranked lists in Python with Reciprocal Rank Fusion.
@@ -309,7 +309,7 @@ The workflow is:
 Normal tables and ordinary indexes should be represented in SQLAlchemy models where practical. The following should be written explicitly in migrations with `op.execute()` or carefully reviewed Alembic operations:
 
 - `create extension if not exists vector`
-- `vector(1536)` embedding columns if the SQLAlchemy type renderer is not sufficient
+- `vector(1024)` embedding columns if the SQLAlchemy type renderer is not sufficient
 - generated `tsvector` columns
 - HNSW indexes for vector search
 - GIN indexes for full-text search and JSON metadata
@@ -361,9 +361,8 @@ Backend settings:
 - `SUPABASE_ANON_KEY`
 - `SUPABASE_SERVICE_ROLE_KEY`
 - `DATABASE_URL` for Alembic and direct Postgres access
-- `OPENAI_API_KEY`
+- `MISTRAL_API_KEY`, chat model name, embedding model name, and embedding dimensions (LLM generation + embeddings both run on Mistral)
 - `ALLOWED_ORIGINS`
-- embedding model name and dimensions
 
 Do not read environment variables directly from components, route handlers, or services. Frontend code should use `src/lib/env.ts`. Backend code should use `app/config.py`.
 
@@ -395,7 +394,7 @@ Supabase remains hosted and stores the durable retrieval data. The Railway backe
 ## Non-Goals
 
 - No Next.js, SSR, server components, or frontend route handlers.
-- No direct OpenAI calls from the browser.
+- No direct LLM/embedding provider calls from the browser.
 - No separate managed vector database outside Supabase.
 - No multi-tenant architecture.
 - No external market/news data.

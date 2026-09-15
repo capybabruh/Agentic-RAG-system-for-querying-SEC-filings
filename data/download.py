@@ -6,13 +6,13 @@ from __future__ import annotations
 import json
 import shutil
 import time
-from datetime import UTC, datetime
+from datetime import timezone, datetime
 from pathlib import Path
 from urllib import request
 
 
 # Params: edit these, then run `uv run data/download.py`
-USER_AGENT = "Document Copilot your.email@example.com"
+USER_AGENT = "Document Copilot tungp2609@gmail.com"
 TICKERS = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL"]
 FILINGS_PER_COMPANY = 5
 OUTPUT_DIR = Path(__file__).resolve().parent / "downloads"
@@ -55,12 +55,12 @@ def download_filings() -> dict:
     target_years = {
         str(year)
         for year in range(
-            datetime.now(UTC).year - FILINGS_PER_COMPANY, datetime.now(UTC).year
+            datetime.now(timezone.utc).year - FILINGS_PER_COMPANY, datetime.now(timezone.utc).year
         )
     }
     manifest = {
         "source": "SEC EDGAR",
-        "generated_at_utc": datetime.now(UTC).isoformat(),
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "form": "10-K",
         "downloaded_count": 0,
         "filings": [],
