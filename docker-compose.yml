@@ -5,7 +5,9 @@
 # docs/guides/railway-deploy.md.
 services:
   backend:
-    build: ./backend
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
     ports:
       - "8000:8000"
     env_file:
@@ -18,7 +20,9 @@ services:
       - /app/.venv
 
   frontend:
-    build: ./frontend
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
     ports:
       - "5173:5173"
     env_file:
