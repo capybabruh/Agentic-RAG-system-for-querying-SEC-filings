@@ -1,0 +1,32 @@
+# Local development only — one command instead of two terminals. See
+# README.md's "Run with Docker" section. Both services still talk to your
+# existing hosted Supabase project via backend/.env and frontend/.env; no
+# database runs in Docker. Not used for Railway deployment — see
+# docs/guides/railway-deploy.md.
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./backend/.env
+    volumes:
+      - ./backend:/app
+      # Anonymous volume: keeps the image's own Linux .venv (built during
+      # `docker compose build`) instead of letting the bind mount above
+      # replace it with whatever .venv exists on the host.
+      - /app/.venv
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "5173:5173"
+    env_file:
+      - ./frontend/.env
+    volumes:
+      - ./frontend:/app
+      # Same trick as the backend's .venv, for node_modules — avoids
+      # host-vs-container native binary mismatches (e.g. esbuild, rollup).
+      - /app/node_modules
+    depends_on:
+      - backend

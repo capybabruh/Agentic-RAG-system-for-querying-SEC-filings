@@ -81,6 +81,29 @@ pnpm dev
 
 Open `http://localhost:5173`, sign in, and ask a question about the ingested filings — you'll see live status updates while the agent searches, a typed-out cited answer, and clickable citation chips linking back to the source passage.
 
+### Run with Docker instead
+
+For local dev without installing Python/uv/Node/pnpm yourself, once both
+`.env` files exist (same requirement as above — Docker doesn't change what
+goes in them; both services still talk to your existing hosted Supabase
+project, no database runs in Docker):
+
+```bash
+docker compose up --build
+```
+
+First time (or after a schema change), apply migrations inside the backend
+container before or alongside `up`:
+
+```bash
+docker compose run --rm backend uv run alembic upgrade head
+```
+
+Both services hot-reload on file changes the same as running them natively.
+This is a local-dev convenience only — Railway deployment uses its own
+buildpack, unaffected by any of this (see
+[docs/guides/railway-deploy.md](docs/guides/railway-deploy.md)).
+
 First-time setup guides:
 
 - [Supabase](docs/guides/supabase-setup.md) — account, hosted project (dashboard or CLI)
