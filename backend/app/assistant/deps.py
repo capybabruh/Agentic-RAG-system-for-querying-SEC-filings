@@ -16,6 +16,10 @@ class DocumentAgentDeps:
     thread_id: str
     db: Session
     retriever: DocumentRetriever
+    # Organizations whose documents this user may read, resolved by the backend from
+    # organization_members (see chat/orchestrator.py). Every retrieval tool passes this
+    # through unchanged; the model has no parameter to widen or change it.
+    allowed_org_ids: list[uuid.UUID]
     # Populated by the search_filings/read_chunk/read_surrounding_chunks tools as they run,
     # so grounding validation can confirm every citation traces back to something retrieved
     # this turn (see app/grounding/validator.py).

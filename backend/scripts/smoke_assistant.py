@@ -25,11 +25,13 @@ import logging
 
 import nest_asyncio
 from pydantic_ai.exceptions import ModelHTTPError
+from sqlalchemy import select
 
 from app.assistant.agent import document_agent
 from app.assistant.deps import DocumentAgentDeps
 from app.assistant.outputs import GroundedAnswer
 from app.chat.orchestrator import _default_retriever
+from app.database.models import Organization
 from app.database.session import SessionLocal
 from app.grounding.validator import GroundingError, validate_citations
 
@@ -71,6 +73,8 @@ async def run_one(key: str) -> None:
             thread_id="smoke-script",
             db=db,
             retriever=_default_retriever(),
+            # Admin smoke test: search across every organization's documents.
+            allowed_org_ids=list(db.scalars(select(Organization.id))),
         )
         answer = await _run_with_retry(key, question, deps)
 

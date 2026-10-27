@@ -17,6 +17,7 @@ from app.config import settings
 from app.database import chats
 from app.database.chats import CitationInput
 from app.database.models import ChatMessage
+from app.database.organizations import get_user_org_ids
 from app.grounding.validator import validate_citations
 from app.retrieval.retriever import DocumentRetriever
 
@@ -53,6 +54,7 @@ async def run_chat_turn(
         thread_id=str(thread_id),
         db=db,
         retriever=retriever or _default_retriever(),
+        allowed_org_ids=get_user_org_ids(db, user_id),
         on_status=status_callback,
     )
 

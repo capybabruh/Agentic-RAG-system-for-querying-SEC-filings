@@ -1,17 +1,25 @@
 """Import converted filing Markdown into the source_documents table.
 
 Run from the backend directory with:
-    uv run python ../data/ingest_documents.py
+    uv run python ../data/ingest_documents.py --org amazon --ticker AMZN
+
+Every imported document is assigned to the organization named by --org, which
+must already exist (see backend/scripts/manage_orgs.py). Only members of that
+organization can retrieve it. To assign already-imported documents, re-run with
+--update; chunks inherit the organization from their document, so no
+re-embedding is needed.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import uuid
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from app.database.models import SourceDocument
+from app.database.organizations import get_org_by_slug
 from app.database.session import SessionLocal
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -41,6 +49,7 @@ def ingest_filing(
     markdown_dir: Path,
     existing_by_url: dict[str, SourceDocument],
     update: bool,
+    org_id: uuid.UUID,
 ) -> str:
     local_path = markdown_dir / Path(filing["local_path"]).with_suffix(".md")
     if not local_path.exists():
@@ -60,6 +69,7 @@ def ingest_filing(
         "source": "SEC EDGAR",
     }
     values = {
+        "org_id": org_id,
         "title": document_title(filing),
         "company_ticker": filing.get("ticker"),
         "filing_type": filing.get("form"),
@@ -80,17 +90,35 @@ def ingest_filing(
     return "updated"
 
 
+def select_filings(filings: list[dict[str, Any]], ticker: str | None) -> list[dict[str, Any]]:
+    if ticker is None:
+        return filings
+    wanted = ticker.strip().upper()
+    return [filing for filing in filings if str(filing.get("ticker", "")).upper() == wanted]
+
+
 def ingest_directory(
     markdown_dir: Path,
     manifest_path: Path,
     update: bool,
+    org_slug: str,
+    ticker: str | None = None,
 ) -> dict[str, int]:
     manifest = load_manifest(manifest_path)
     filings = manifest.get("filings", [])
     if not isinstance(filings, list):
         raise TypeError("Manifest filings must be a list")
+    filings = select_filings(filings, ticker)
+    if not filings:
+        raise ValueError(f"No filings in the manifest match ticker {ticker!r}")
 
     with SessionLocal.begin() as db:
+        org = get_org_by_slug(db, org_slug.strip().lower())
+        if org is None:
+            raise ValueError(
+                f"Organization '{org_slug}' does not exist — create it with "
+                "backend/scripts/manage_orgs.py create-org first"
+            )
         existing_documents = db.scalars(select(SourceDocument)).all()
         existing_by_url = {
             document.source_url: document
@@ -99,7 +127,7 @@ def ingest_directory(
         }
         counts = {"inserted": 0, "updated": 0, "skipped": 0}
         for filing in filings:
-            result = ingest_filing(db, filing, markdown_dir, existing_by_url, update)
+            result = ingest_filing(db, filing, markdown_dir, existing_by_url, update, org.id)
             counts[result] += 1
             print(f"{result.capitalize()}: {filing['local_path']}")
 
@@ -121,6 +149,15 @@ def parse_args() -> argparse.Namespace:
         help=f"Download manifest path (default: {DEFAULT_MANIFEST_PATH})",
     )
     parser.add_argument(
+        "--org",
+        required=True,
+        help="Slug of the organization that owns these documents, e.g. amazon.",
+    )
+    parser.add_argument(
+        "--ticker",
+        help="Only import manifest filings for this ticker, e.g. AMZN.",
+    )
+    parser.add_argument(
         "--update",
         action="store_true",
         help="Update already-imported documents from their Markdown files.",
@@ -130,9 +167,16 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    counts = ingest_directory(
-        args.markdown_dir.resolve(), args.manifest.resolve(), args.update
-    )
+    try:
+        counts = ingest_directory(
+            args.markdown_dir.resolve(),
+            args.manifest.resolve(),
+            args.update,
+            args.org,
+            args.ticker,
+        )
+    except ValueError as error:
+        raise SystemExit(f"Error: {error}") from error
     print(
         "Imported documents: "
         f"{counts['inserted']} inserted, {counts['updated']} updated, "

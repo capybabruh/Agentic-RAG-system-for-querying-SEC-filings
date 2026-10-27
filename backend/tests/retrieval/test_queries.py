@@ -6,11 +6,14 @@ corpus (see data/ingest_documents.py, data/ingest_chunks.py). Run with:
 """
 from __future__ import annotations
 
+import uuid
+
 import pytest
 from mistralai.client import Mistral
-from sqlalchemy import text
+from sqlalchemy import select, text
 
 from app.config import settings
+from app.database.models import Organization
 from app.database.session import SessionLocal
 from app.retrieval.queries import fulltext_search, vector_search
 
@@ -21,6 +24,14 @@ pytestmark = pytest.mark.integration
 def db():
     with SessionLocal() as session:
         yield session
+
+
+@pytest.fixture
+def org_ids(db):
+    ids = list(db.scalars(select(Organization.id)))
+    if not ids:
+        pytest.skip("No organizations — assign documents with ingest_documents.py --org first")
+    return ids
 
 
 @pytest.fixture(scope="module")
@@ -50,49 +61,57 @@ def tickers_for(db, chunk_ids) -> set[str | None]:
     return {row[0] for row in rows}
 
 
-def test_vector_search_returns_results_ordered_by_ascending_distance(db, mistral_client):
+def test_vector_search_returns_results_ordered_by_ascending_distance(db, mistral_client, org_ids):
     embedding = embed(mistral_client, "iPhone revenue and Services segment growth")
 
-    results = vector_search(db, embedding, limit=10)
+    results = vector_search(db, embedding, limit=10, allowed_org_ids=org_ids)
 
     assert results
     scores = [r.score for r in results]
     assert scores == sorted(scores)
 
 
-def test_vector_search_respects_limit(db, mistral_client):
+def test_vector_search_respects_limit(db, mistral_client, org_ids):
     embedding = embed(mistral_client, "cloud infrastructure capital expenditures")
 
-    results = vector_search(db, embedding, limit=3)
+    results = vector_search(db, embedding, limit=3, allowed_org_ids=org_ids)
 
     assert len(results) <= 3
 
 
-def test_vector_search_filters_by_ticker(db, mistral_client):
+def test_vector_search_filters_by_ticker(db, mistral_client, org_ids):
     embedding = embed(mistral_client, "iPhone revenue and Services segment growth")
 
-    results = vector_search(db, embedding, limit=10, ticker="AAPL")
+    results = vector_search(db, embedding, limit=10, ticker="AAPL", allowed_org_ids=org_ids)
 
     assert results
     assert tickers_for(db, [r.chunk_id for r in results]) == {"AAPL"}
 
 
-def test_fulltext_search_returns_results_for_known_term(db):
-    results = fulltext_search(db, "iPhone", limit=10, ticker="AAPL")
+def test_fulltext_search_returns_results_for_known_term(db, org_ids):
+    results = fulltext_search(db, "iPhone", limit=10, ticker="AAPL", allowed_org_ids=org_ids)
 
     assert results
     scores = [r.score for r in results]
     assert scores == sorted(scores, reverse=True)
 
 
-def test_fulltext_search_filters_by_filing_type(db):
-    results = fulltext_search(db, "revenue", limit=10, ticker="NVDA", filing_type="10-K")
+def test_fulltext_search_filters_by_filing_type(db, org_ids):
+    results = fulltext_search(db, "revenue", limit=10, ticker="NVDA", filing_type="10-K", allowed_org_ids=org_ids)
 
     assert results
     assert tickers_for(db, [r.chunk_id for r in results]) == {"NVDA"}
 
 
-def test_fulltext_search_no_match_returns_empty(db):
-    results = fulltext_search(db, "xyzzyplughnonsenseterm", limit=10)
+def test_fulltext_search_no_match_returns_empty(db, org_ids):
+    results = fulltext_search(db, "xyzzyplughnonsenseterm", limit=10, allowed_org_ids=org_ids)
 
     assert results == []
+
+
+def test_searches_return_nothing_for_an_organization_with_no_documents(db, mistral_client):
+    embedding = embed(mistral_client, "iPhone revenue and Services segment growth")
+    unknown_org = [uuid.uuid4()]
+
+    assert vector_search(db, embedding, limit=10, allowed_org_ids=unknown_org) == []
+    assert fulltext_search(db, "iPhone", limit=10, allowed_org_ids=unknown_org) == []

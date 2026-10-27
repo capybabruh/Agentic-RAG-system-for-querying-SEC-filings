@@ -55,7 +55,13 @@ def search_filings(
     _status(ctx, "search", f"Searching filings{f' for {ticker}' if ticker else ''}...")
     started = time.perf_counter()
     with ctx.deps.db_lock:
-        passages = ctx.deps.retriever.search(ctx.deps.db, query, ticker=ticker, filing_type=filing_type)
+        passages = ctx.deps.retriever.search(
+            ctx.deps.db,
+            query,
+            ticker=ticker,
+            filing_type=filing_type,
+            allowed_org_ids=ctx.deps.allowed_org_ids,
+        )
     elapsed = time.perf_counter() - started
     passages = _remember(ctx, passages)
     logger.info(
@@ -76,7 +82,9 @@ def read_chunk(ctx: RunContext[DocumentAgentDeps], chunk_id: uuid.UUID) -> Sourc
     _status(ctx, "read_chunk", "Reading a specific passage...")
     started = time.perf_counter()
     with ctx.deps.db_lock:
-        passages = ctx.deps.retriever.read_surrounding_chunks(ctx.deps.db, chunk_id, window=0)
+        passages = ctx.deps.retriever.read_surrounding_chunks(
+            ctx.deps.db, chunk_id, window=0, allowed_org_ids=ctx.deps.allowed_org_ids
+        )
     elapsed = time.perf_counter() - started
     passages = _remember(ctx, passages)
     logger.info("[thread %s] read_chunk(%s) took %.2fs", ctx.deps.thread_id, chunk_id, elapsed)
@@ -91,7 +99,9 @@ def read_surrounding_chunks(
     _status(ctx, "read_context", "Reading surrounding context...")
     started = time.perf_counter()
     with ctx.deps.db_lock:
-        passages = ctx.deps.retriever.read_surrounding_chunks(ctx.deps.db, chunk_id, window=window)
+        passages = ctx.deps.retriever.read_surrounding_chunks(
+            ctx.deps.db, chunk_id, window=window, allowed_org_ids=ctx.deps.allowed_org_ids
+        )
     elapsed = time.perf_counter() - started
     logger.info(
         "[thread %s] read_surrounding_chunks(%s, window=%d) took %.2fs, found %d passage(s)",

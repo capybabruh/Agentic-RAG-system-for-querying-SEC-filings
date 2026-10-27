@@ -36,6 +36,9 @@ class FakeMistralClient:
         self.chat = FakeChatClient(chat_content)
 
 
+ORG_ID = uuid.uuid4()
+
+
 def make_document(ticker="AAPL", filing_type="10-K", source_url="https://example/aapl.htm"):
     return SourceDocument(
         id=uuid.uuid4(),
@@ -71,12 +74,18 @@ class FakeSession:
     def __init__(self, chunks_by_id=None, execute_rows=None):
         self._chunks_by_id = chunks_by_id or {}
         self._execute_rows = execute_rows or []
+        self.statements = []
 
     def get(self, model, id):
         return self._chunks_by_id.get(id)
 
     def execute(self, stmt):
+        self.statements.append(stmt)
         return FakeResult(self._execute_rows)
+
+
+def filters_by_org(stmt) -> bool:
+    return "source_documents.org_id IN" in str(stmt)
 
 
 def test_search_fuses_vector_and_fulltext_and_hydrates_in_fused_order(monkeypatch):
@@ -87,7 +96,7 @@ def test_search_fuses_vector_and_fulltext_and_hydrates_in_fused_order(monkeypatc
     monkeypatch.setattr(
         retriever_module,
         "vector_search",
-        lambda db, embedding, limit, ticker, filing_type: [
+        lambda db, embedding, limit, ticker, filing_type, allowed_org_ids: [
             RankedChunkId(chunk_id=chunk_a.id, rank=0, score=0.1),
             RankedChunkId(chunk_id=chunk_b.id, rank=1, score=0.2),
         ],
@@ -95,7 +104,7 @@ def test_search_fuses_vector_and_fulltext_and_hydrates_in_fused_order(monkeypatc
     monkeypatch.setattr(
         retriever_module,
         "fulltext_search",
-        lambda db, query, limit, ticker, filing_type: [
+        lambda db, query, limit, ticker, filing_type, allowed_org_ids: [
             RankedChunkId(chunk_id=chunk_b.id, rank=0, score=1.5),
         ],
     )
@@ -104,7 +113,7 @@ def test_search_fuses_vector_and_fulltext_and_hydrates_in_fused_order(monkeypatc
     client = FakeMistralClient(vector=[0.1, 0.2, 0.3])
     retriever = DocumentRetriever(client, "mistral-embed")
 
-    passages = retriever.search(session, "revenue mix", top_k=2, candidate_k=10)
+    passages = retriever.search(session, "revenue mix", top_k=2, candidate_k=10, allowed_org_ids=[ORG_ID])
 
     assert [p.chunk_id for p in passages] == [chunk_b.id, chunk_a.id]
     assert client.embeddings.calls == [("mistral-embed", ["revenue mix"])]
@@ -120,36 +129,36 @@ def test_search_respects_top_k_after_fusion(monkeypatch):
     monkeypatch.setattr(
         retriever_module,
         "vector_search",
-        lambda db, embedding, limit, ticker, filing_type: [
+        lambda db, embedding, limit, ticker, filing_type, allowed_org_ids: [
             RankedChunkId(chunk_id=c.id, rank=i, score=0.0) for i, c in enumerate(chunks)
         ],
     )
     monkeypatch.setattr(
-        retriever_module, "fulltext_search", lambda db, query, limit, ticker, filing_type: []
+        retriever_module, "fulltext_search", lambda db, query, limit, ticker, filing_type, allowed_org_ids: []
     )
 
     session = FakeSession(execute_rows=[(c, document) for c in chunks[:2]])
     client = FakeMistralClient(vector=[0.0])
     retriever = DocumentRetriever(client, "mistral-embed")
 
-    passages = retriever.search(session, "query", top_k=2, candidate_k=10)
+    passages = retriever.search(session, "query", top_k=2, candidate_k=10, allowed_org_ids=[ORG_ID])
 
     assert [p.chunk_id for p in passages] == [chunks[0].id, chunks[1].id]
 
 
 def test_search_with_no_results_returns_empty_list(monkeypatch):
     monkeypatch.setattr(
-        retriever_module, "vector_search", lambda db, embedding, limit, ticker, filing_type: []
+        retriever_module, "vector_search", lambda db, embedding, limit, ticker, filing_type, allowed_org_ids: []
     )
     monkeypatch.setattr(
-        retriever_module, "fulltext_search", lambda db, query, limit, ticker, filing_type: []
+        retriever_module, "fulltext_search", lambda db, query, limit, ticker, filing_type, allowed_org_ids: []
     )
 
     session = FakeSession()
     client = FakeMistralClient(vector=[0.0])
     retriever = DocumentRetriever(client, "mistral-embed")
 
-    assert retriever.search(session, "nothing matches") == []
+    assert retriever.search(session, "nothing matches", allowed_org_ids=[ORG_ID]) == []
 
 
 def test_read_surrounding_chunks_returns_neighbors_ordered_by_index():
@@ -163,7 +172,7 @@ def test_read_surrounding_chunks_returns_neighbors_ordered_by_index():
     )
     retriever = DocumentRetriever(FakeMistralClient([]), "mistral-embed")
 
-    passages = retriever.read_surrounding_chunks(session, target.id, window=1)
+    passages = retriever.read_surrounding_chunks(session, target.id, window=1, allowed_org_ids=[ORG_ID])
 
     assert [p.chunk_id for p in passages] == [c.id for c in neighbors]
 
@@ -172,17 +181,17 @@ def test_read_surrounding_chunks_missing_target_returns_empty():
     session = FakeSession()
     retriever = DocumentRetriever(FakeMistralClient([]), "mistral-embed")
 
-    assert retriever.read_surrounding_chunks(session, uuid.uuid4()) == []
+    assert retriever.read_surrounding_chunks(session, uuid.uuid4(), allowed_org_ids=[ORG_ID]) == []
 
 
 def test_search_sends_extracted_keywords_to_fulltext_search(monkeypatch):
     captured = {}
 
     monkeypatch.setattr(
-        retriever_module, "vector_search", lambda db, embedding, limit, ticker, filing_type: []
+        retriever_module, "vector_search", lambda db, embedding, limit, ticker, filing_type, allowed_org_ids: []
     )
 
-    def fake_fulltext_search(db, query, limit, ticker, filing_type):
+    def fake_fulltext_search(db, query, limit, ticker, filing_type, allowed_org_ids):
         captured["query"] = query
         return []
 
@@ -191,7 +200,7 @@ def test_search_sends_extracted_keywords_to_fulltext_search(monkeypatch):
     client = FakeMistralClient(vector=[0.0], chat_content="revenue mix, iPhone, Services")
     retriever = DocumentRetriever(client, "mistral-embed", chat_model="mistral-small-latest")
 
-    retriever.search(FakeSession(), "how did revenue mix change across products?")
+    retriever.search(FakeSession(), "how did revenue mix change across products?", allowed_org_ids=[ORG_ID])
 
     assert captured["query"] == "revenue mix iPhone Services"
     assert client.chat.calls[0]["model"] == "mistral-small-latest"
@@ -201,10 +210,10 @@ def test_search_uses_raw_query_when_keyword_extraction_disabled(monkeypatch):
     captured = {}
 
     monkeypatch.setattr(
-        retriever_module, "vector_search", lambda db, embedding, limit, ticker, filing_type: []
+        retriever_module, "vector_search", lambda db, embedding, limit, ticker, filing_type, allowed_org_ids: []
     )
 
-    def fake_fulltext_search(db, query, limit, ticker, filing_type):
+    def fake_fulltext_search(db, query, limit, ticker, filing_type, allowed_org_ids):
         captured["query"] = query
         return []
 
@@ -213,7 +222,67 @@ def test_search_uses_raw_query_when_keyword_extraction_disabled(monkeypatch):
     client = FakeMistralClient(vector=[0.0])
     retriever = DocumentRetriever(client, "mistral-embed", keyword_extraction_enabled=False)
 
-    retriever.search(FakeSession(), "how did revenue mix change across products?")
+    retriever.search(FakeSession(), "how did revenue mix change across products?", allowed_org_ids=[ORG_ID])
 
     assert captured["query"] == "how did revenue mix change across products?"
     assert client.chat.calls == []
+
+
+def test_search_forwards_allowed_org_ids_to_both_queries_and_hydration(monkeypatch):
+    document = make_document()
+    chunk = make_chunk(document, 0)
+    captured = {}
+
+    def fake_vector_search(db, embedding, limit, ticker, filing_type, allowed_org_ids):
+        captured["vector"] = allowed_org_ids
+        return [RankedChunkId(chunk_id=chunk.id, rank=0, score=0.1)]
+
+    def fake_fulltext_search(db, query, limit, ticker, filing_type, allowed_org_ids):
+        captured["fulltext"] = allowed_org_ids
+        return []
+
+    monkeypatch.setattr(retriever_module, "vector_search", fake_vector_search)
+    monkeypatch.setattr(retriever_module, "fulltext_search", fake_fulltext_search)
+
+    session = FakeSession(execute_rows=[(chunk, document)])
+    retriever = DocumentRetriever(FakeMistralClient(vector=[0.0]), "mistral-embed")
+
+    retriever.search(session, "revenue", ticker="AMZN", allowed_org_ids=[ORG_ID])
+
+    assert captured == {"vector": [ORG_ID], "fulltext": [ORG_ID]}
+    assert session.statements and all(filters_by_org(stmt) for stmt in session.statements)
+
+
+def test_search_with_no_orgs_returns_nothing_without_calling_mistral(monkeypatch):
+    def fail(*args, **kwargs):
+        raise AssertionError("no query should run for a user with no organizations")
+
+    monkeypatch.setattr(retriever_module, "vector_search", fail)
+    monkeypatch.setattr(retriever_module, "fulltext_search", fail)
+
+    client = FakeMistralClient(vector=[0.0])
+    retriever = DocumentRetriever(client, "mistral-embed")
+
+    assert retriever.search(FakeSession(), "revenue", allowed_org_ids=[]) == []
+    assert client.embeddings.calls == []
+    assert client.chat.calls == []
+
+
+def test_read_surrounding_chunks_filters_neighbors_by_org():
+    document = make_document()
+    target = make_chunk(document, 5)
+    session = FakeSession(chunks_by_id={target.id: target}, execute_rows=[])
+    retriever = DocumentRetriever(FakeMistralClient([]), "mistral-embed")
+
+    # A chunk from another organization: the org filter leaves no rows, so nothing is returned.
+    assert retriever.read_surrounding_chunks(session, target.id, allowed_org_ids=[ORG_ID]) == []
+    assert len(session.statements) == 1
+    assert filters_by_org(session.statements[0])
+
+
+def test_read_surrounding_chunks_with_no_orgs_does_not_touch_the_database():
+    session = FakeSession()
+    retriever = DocumentRetriever(FakeMistralClient([]), "mistral-embed")
+
+    assert retriever.read_surrounding_chunks(session, uuid.uuid4(), allowed_org_ids=[]) == []
+    assert session.statements == []
