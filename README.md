@@ -28,6 +28,7 @@ The scenario (client: **Driftwood Capital**, a fictional independent research fi
 - **A typed agent, not a prompt string** — [PydanticAI](https://ai.pydantic.dev/) gives the LLM three bounded tools (`search_filings`, `read_chunk`, `read_surrounding_chunks`) and a typed `GroundedAnswer` output, so the whole reasoning loop is testable without hitting a live model.
 - **Streamed like a real chat** — SSE streaming with live status updates ("Searching filings for AAPL...") while the agent works, then a typed-out, markdown-formatted, cited answer.
 - **Real auth, real multi-user history** — Supabase email auth, per-user chat threads, sign-out on token expiry.
+- **Organization-scoped documents** — every filing belongs to an organization, and users retrieve only their organizations' documents. The scope is applied by the backend in every retrieval query; the LLM has no way to choose or widen it.
 - **Shipped, not just scaffolded** — retrieval, grounding, citations UI, streaming, and a full production deploy are all done. See [docs/todo.md](docs/todo.md) for the build log, including real bugs found and fixed along the way (a concurrency bug in shared DB sessions across agent tool calls, a silent-stall bug traced to a missing disconnect check, a latency fix from parallelizing two sequential Mistral calls).
 
 ## How it works
@@ -40,7 +41,7 @@ flowchart LR
         direction TB
         A1[SEC EDGAR] --> A2[Download 10-Ks]
         A2 --> A3[Convert HTML to Markdown]
-        A3 --> A4[Import source documents]
+        A3 --> A4[Import source documents<br/>tagged with org_id]
         A4 --> A5[Chunk + embed]
     end
 
@@ -48,8 +49,8 @@ flowchart LR
 
     subgraph Chat["Chat — online, per question"]
         direction TB
-        B1[Analyst asks a question] --> B2[FastAPI /chat/stream]
-        B2 --> B3[PydanticAI agent<br/>+ hybrid retrieval]
+        B1[Analyst asks a question] --> B2[FastAPI /chat/stream<br/>resolve user's orgs]
+        B2 --> B3[PydanticAI agent<br/>+ org-scoped hybrid retrieval]
         B3 --> B4[Validate every citation]
         B4 --> B5[Stream cited answer]
     end
@@ -73,10 +74,11 @@ flowchart LR
 
     subgraph supabase[Supabase]
         auth[Auth<br/>email session]
-        db[(Postgres<br/>chats, documents, chunks<br/>pgvector + full-text)]
+        db[(Postgres<br/>chats, documents, chunks<br/>organizations + members<br/>pgvector + full-text)]
     end
 
     mistral[Mistral<br/>LLM generation + embeddings]
+    admin[Admin CLI<br/>orgs + ingestion]
 
     frontend -->|serves app| browser
     browser -->|sign in| auth
@@ -85,7 +87,30 @@ flowchart LR
     backend -->|retrieve + persist| db
     backend -->|generate answer + embed| mistral
     backend -->|stream answer + citations| browser
+    admin -->|organizations, memberships,<br/>org-tagged documents| db
 ```
+
+### Access control
+
+All organizations share one database; each document carries an `org_id`, and each user is granted organizations through `organization_members`. On every turn the backend resolves the user's organizations and passes them to the agent's tools, which add `org_id = ANY(allowed_org_ids)` to every retrieval query.
+
+```mermaid
+flowchart LR
+    jwt[JWT verified<br/>user_id] --> members[(organization_members)]
+    members -->|allowed_org_ids| deps[Agent deps]
+    llm[LLM proposes<br/>query, ticker, chunk_id] --> tools
+    deps --> tools[search_filings<br/>read_chunk<br/>read_surrounding_chunks]
+    tools -->|"WHERE org_id = ANY(allowed_org_ids)"| docs[(source_documents<br/>+ document_chunks)]
+    docs -->|only the user's<br/>organizations' passages| llm
+```
+
+| Who | Organization | Can retrieve |
+| --- | --- | --- |
+| An | `amazon` | AMZN filings only |
+| Bình | `meta` | META filings only |
+| A user with no membership | — | nothing (the agent reports insufficient evidence) |
+
+The LLM never queries the database and no tool accepts an organization argument, so a prompt cannot widen access; a guessed `chunk_id` from another organization is filtered out too. Admins manage organizations with `backend/scripts/manage_orgs.py` and assign documents with `ingest_documents.py --org`. The data model, request sequence, enforcement points, rollout order, and known gaps (notably RLS, not yet enabled) are in [docs/architecture.md → Access Control](docs/architecture.md#access-control).
 
 *Full rationale for every decision here — why hybrid retrieval, why grounding is enforced server-side, why Railway/Supabase over alternatives — is in [docs/architecture.md](docs/architecture.md).*
 
@@ -95,7 +120,8 @@ flowchart LR
 | ------------------ | ----------------------------------------------------- |
 | Backend            | Python + FastAPI                                     |
 | Frontend           | Vite + React SPA + TypeScript                        |
-| Database           | Supabase Postgres (users, chats, documents, chunks)  |
+| Database           | Supabase Postgres (users, organizations, chats, documents, chunks) |
+| Access control     | Organization membership → `org_id` filter on every retrieval query |
 | Migrations         | SQLAlchemy models + Alembic                          |
 | Retrieval          | Supabase `pgvector` + Postgres full-text search, fused with Reciprocal Rank Fusion |
 | Agent              | PydanticAI (typed tools + grounded structured output) |
@@ -187,11 +213,22 @@ By default this downloads the latest 5 10-K filings for AAPL, MSFT, NVDA, AMZN, 
 
 From there, converting to Markdown, importing into Supabase, and chunking + embedding are separate steps — see [data/README.md](data/README.md) for the full ingestion pipeline.
 
+Imported documents must belong to an organization, and users only see documents of organizations they're members of. From `backend/`, create an organization, import its filings, then grant access:
+
+```bash
+uv run python scripts/manage_orgs.py create-org amazon "Amazon"
+uv run python ../data/ingest_documents.py --org amazon --ticker AMZN
+uv run python scripts/manage_orgs.py add-member an@amazon.com amazon
+```
+
+Users must sign in once before they can be added. Without a membership, a signed-in user's questions return no evidence.
+
 ## Project docs
 
 | Question | Go to |
 | --- | --- |
 | Why is the system built this way? | [docs/architecture.md](docs/architecture.md) |
+| Who can read which documents, and how is it enforced? | [docs/architecture.md → Access Control](docs/architecture.md#access-control) |
 | What's the actual client brief and example questions? | [docs/client-brief.md](docs/client-brief.md) |
 | Visual pipeline diagrams | [docs/flowchart.md](docs/flowchart.md) |
 | Exact function names and call order for one turn? | [docs/pipeline.md](docs/pipeline.md) |

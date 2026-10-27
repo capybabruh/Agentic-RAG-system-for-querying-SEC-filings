@@ -21,12 +21,13 @@ flowchart LR
 
     subgraph supabase[Supabase]
         auth[Auth<br/>email session]
-        db[(Postgres<br/>chats, documents, chunks<br/>pgvector + full-text)]
+        db[(Postgres<br/>chats, documents, chunks<br/>organizations + members<br/>pgvector + full-text)]
     end
 
     mistral[Mistral<br/>LLM generation + embeddings]
     corpus[SEC filing corpus]
     ingestion[Ingestion pipeline<br/>download, parse, chunk, embed]
+    admin[Admin CLI<br/>manage_orgs.py]
 
     frontend -->|serves app| browser
     browser -->|sign in| auth
@@ -39,14 +40,16 @@ flowchart LR
 
     corpus --> ingestion
     ingestion -->|create embeddings| mistral
-    ingestion -->|store documents + chunks| db
+    ingestion -->|store documents + chunks<br/>tagged with org_id| db
+    admin -->|organizations + memberships| db
 ```
 
 ## Architectural Goals
 
 - Keep the browser thin: it renders chat state, manages the user's Supabase session, and streams assistant responses.
 - Keep the backend authoritative: retrieval, grounding, citation checks, tool execution, and database writes happen in FastAPI.
-- Use Supabase for identity and durable product state: users, chat threads, source documents, chunks, embeddings, and citation metadata.
+- Use Supabase for identity and durable product state: users, organizations and their members, chat threads, source documents, chunks, embeddings, and citation metadata.
+- Scope every document read to the requesting user's organizations, enforced by the backend and never decided by the model (see [Access Control](#access-control)).
 - Use Supabase `pgvector` for semantic retrieval and Postgres full-text search for keyword retrieval.
 - Make the LLM path typed and testable by using PydanticAI agents with explicit dependencies, outputs, and tool boundaries.
 - Preserve a simple deployment model on Railway: one frontend service, one stateless backend service, and hosted Supabase.
@@ -96,7 +99,7 @@ Supabase is responsible for authentication and durable product state. Browser ac
 4. The chat UI uses the Vercel AI SDK React primitives to manage message state and submit new user messages to the FastAPI chat endpoint.
 5. The frontend sends the Supabase access token as `Authorization: Bearer <token>`.
 6. FastAPI verifies the token with Supabase Auth before doing any retrieval or LLM work.
-7. FastAPI creates a request-scoped context containing the authenticated user, chat thread, Supabase client, retrieval service, citation policy, and LLM settings.
+7. FastAPI resolves the user's organizations from `organization_members` and creates a request-scoped context containing the authenticated user, chat thread, allowed organization IDs, database session, retrieval service, and status callback.
 8. A PydanticAI agent retrieves relevant document chunks, generates a grounded answer, and returns typed output containing answer text and citations.
 9. FastAPI streams assistant message parts back to the browser in the format expected by the AI SDK client.
 10. FastAPI persists the final user message, assistant message, cited chunks, and usage metadata to Supabase.
@@ -176,8 +179,10 @@ The agent should receive explicit dependencies rather than reaching into globals
 class DocumentAgentDeps:
     user_id: str
     thread_id: str
+    db: Session
     retriever: DocumentRetriever
-    grounding_validator: GroundingValidator
+    allowed_org_ids: list[uuid.UUID]  # resolved by the backend, never by the model
+    retrieved_chunk_ids: set[uuid.UUID]  # filled by tools, checked by grounding
 
 
 class GroundedAnswer(BaseModel):
@@ -208,6 +213,119 @@ Document Copilot uses hybrid retrieval:
 
 This keeps the database responsible for efficient ranked retrieval and keeps the application responsible for product-specific ranking policy. The first implementation should avoid agent-generated SQL; the PydanticAI agent receives bounded tools such as `search_filings`, `read_chunk`, and `read_surrounding_chunks`.
 
+Both ranked queries, the passage hydration step, and neighbor reads are scoped to the caller's organizations with `source_documents.org_id`, so ranking only ever happens over documents the user may read.
+
+## Access Control
+
+Document Copilot is a shared corpus with per-organization visibility: an Amazon analyst retrieves only Amazon's filings, a Meta analyst only Meta's. All organizations share one database; isolation is a row-level `org_id` filter applied by the backend on every read path, not separate databases or schemas.
+
+### Three checks per request
+
+| Layer | Question it answers | Mechanism | Failure |
+| --- | --- | --- | --- |
+| Authentication | Who is this? | Supabase Auth JWT, verified by `get_current_user` on every request | `401` |
+| Chat ownership | Is this your thread? | `chat_threads.user_id` checked by `require_owned_thread` | `403` |
+| Document scope | Which documents may you read? | `organization_members` → `allowed_org_ids` → `source_documents.org_id` filter in every retrieval query | Empty results; the agent reports insufficient evidence |
+
+### Data model
+
+```mermaid
+erDiagram
+    users ||--o{ organization_members : "belongs to"
+    organizations ||--o{ organization_members : has
+    organizations ||--o{ source_documents : owns
+    source_documents ||--o{ document_chunks : "split into"
+    users ||--o{ chat_threads : owns
+
+    organizations {
+        uuid id PK
+        string slug "unique, e.g. amazon"
+        string name
+    }
+    organization_members {
+        uuid org_id PK
+        uuid user_id PK
+        string role "member by default"
+    }
+    source_documents {
+        uuid id PK
+        uuid org_id FK "NULL = visible to nobody"
+        string company_ticker
+    }
+```
+
+- A user can belong to several organizations (composite key `org_id, user_id`); an auditor covering two companies gets two membership rows.
+- Only `source_documents` carries `org_id`. Chunks inherit it through `source_document_id`, so re-tagging a document never requires re-embedding.
+- Deleting an organization cascades to its memberships and documents.
+
+### Request path
+
+```mermaid
+sequenceDiagram
+    actor An as An (Amazon analyst)
+    participant API as FastAPI
+    participant LLM as Mistral agent
+    participant DB as Postgres
+
+    An->>API: POST /chat/stream + JWT
+    API->>API: verify JWT, check thread ownership
+    API->>DB: SELECT org_id FROM organization_members WHERE user_id = An
+    DB-->>API: [amazon]
+    API->>LLM: question + tool definitions (no org parameter)
+    LLM-->>API: call search_filings(query, ticker)
+    API->>DB: hybrid search WHERE d.org_id = ANY([amazon])
+    DB-->>API: Amazon passages only
+    API->>LLM: tool result
+    LLM-->>API: GroundedAnswer + citations
+    API->>API: validate citations against retrieved chunk IDs
+    API-->>An: stream answer citing Amazon filings
+```
+
+The model never touches the database. It only proposes tool arguments (`query`, `ticker`, `filing_type`, `chunk_id`); the backend executes the tool with `allowed_org_ids` taken from `DocumentAgentDeps`. If the model asks for `ticker="META"` on An's behalf, the query still carries `org_id = ANY([amazon])` and returns nothing. A guessed `chunk_id` from another organization is filtered the same way in `read_chunk` and `read_surrounding_chunks`.
+
+### Enforcement points
+
+| Where | What it enforces |
+| --- | --- |
+| `app/database/organizations.py::get_user_org_ids` | Resolves the user's organizations from `organization_members` |
+| `app/chat/orchestrator.py::run_chat_turn` | Puts the resolved IDs into `DocumentAgentDeps.allowed_org_ids` for the turn |
+| `app/assistant/agent.py` | All three tools pass `ctx.deps.allowed_org_ids` through; none exposes an org parameter to the model (covered by a test) |
+| `app/retrieval/queries.py` | `vector_search` and `fulltext_search` add `d.org_id = ANY(:allowed_org_ids)` |
+| `app/retrieval/retriever.py` | `_load_passages` and `read_surrounding_chunks` filter on `SourceDocument.org_id`; an empty list returns nothing without calling Mistral |
+
+Policy is deny-by-default: a user with no memberships, or a document with `org_id IS NULL`, matches nothing.
+
+### Administration
+
+Access is managed by an admin from the backend, not self-served in the app.
+
+```bash
+# from backend/
+uv run python scripts/manage_orgs.py create-org amazon "Amazon"
+uv run python scripts/manage_orgs.py add-member an@amazon.com amazon     # user must have signed in once
+uv run python scripts/manage_orgs.py remove-member an@amazon.com amazon
+uv run python scripts/manage_orgs.py list                                # members, document counts, untagged documents
+
+# assign documents while importing (--org is required, --ticker optional)
+uv run python ../data/ingest_documents.py --org amazon --ticker AMZN
+# tag documents that were imported before organizations existed (no re-embedding)
+uv run python ../data/ingest_documents.py --org amazon --ticker AMZN --update
+```
+
+The importer refuses to run when the organization does not exist, so a typo cannot silently create untagged or mis-tagged documents. Organization membership is never read from Supabase `user_metadata`, which users can edit themselves.
+
+### Rollout
+
+Migration `20261028_000003` adds the tables and a nullable `org_id`. Until existing documents are tagged, nobody can retrieve them, so apply the migration, create organizations, re-run the importer with `--update` per ticker, then add members — in that order.
+
+### Known gaps
+
+- **No RLS yet.** The tables live in Supabase's `public` schema without row-level security, so the browser-visible anon key can reach them through Supabase's Data API. The backend's own filter does not cover that path. Enabling RLS on every table (no policies are needed while the browser never queries tables directly) is the next step; policies keyed on `auth.uid()` would add database-level defense in depth.
+- **Backend connects as a privileged role**, so correctness of the `org_id` filter depends on application code and its tests.
+- **`org_id` is nullable** until the corpus is backfilled; a follow-up migration can make it `NOT NULL`.
+- **Filtered HNSW search** may return fewer than `retrieval_candidate_k` vector candidates for small organizations; pgvector 0.8's `hnsw.iterative_scan` addresses this.
+- **No in-app upload or roles beyond `member`.** Uploads would take `org_id` from the uploader's membership, never from client input.
+
 ## Supabase and FastAPI Communication
 
 Supabase Auth is the identity source. FastAPI must treat the browser's Supabase JWT as the request credential.
@@ -225,6 +343,7 @@ Backend rules:
 - Verify `Authorization: Bearer <token>` at the FastAPI boundary.
 - Reject unauthenticated requests before retrieval or LLM work.
 - Derive `user_id` and email from the verified Supabase user.
+- Derive document scope from `organization_members` for that `user_id`; never accept an organization from the request body or from model output.
 - Use user-scoped database operations wherever possible.
 - Use the service-role key only on the backend for privileged writes that cannot be safely performed with the anon key.
 - Always attach persisted chat records to the authenticated `user_id`.
@@ -276,7 +395,9 @@ Supabase tables should be small and product-oriented:
 - `chat_threads`: thread metadata, owner, title, timestamps.
 - `chat_messages`: user and assistant messages in order, with AI SDK-compatible message JSON where useful.
 - `message_citations`: normalized citation records linked to assistant messages.
-- `source_documents`: original document records with filing metadata, source URL, and normalized Markdown content.
+- `organizations`: tenants that own documents, keyed by a unique slug such as `amazon`.
+- `organization_members`: which users may read which organization's documents, with a role.
+- `source_documents`: original document records with owning `org_id`, filing metadata, source URL, and normalized Markdown content.
 - `document_chunks`: chunk text, chunk metadata, embeddings, and generated full-text search vectors.
 
 `source_documents` stores the normalized Markdown version of each filing so the application can re-chunk, inspect, and cite the original extracted text without reaching back into downloaded HTML files. `document_chunks` stores retrieval-ready passages:
@@ -396,6 +517,6 @@ Supabase remains hosted and stores the durable retrieval data. The Railway backe
 - No Next.js, SSR, server components, or frontend route handlers.
 - No direct LLM/embedding provider calls from the browser.
 - No separate managed vector database outside Supabase.
-- No multi-tenant architecture.
+- No per-tenant databases or schemas: organizations share one database and are isolated by `org_id` (see [Access Control](#access-control)).
 - No external market/news data.
 - No trading recommendations or generated stock picks.

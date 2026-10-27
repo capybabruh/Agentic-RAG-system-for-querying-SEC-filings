@@ -144,6 +144,19 @@ The backend logs detailed, timestamped tracing for every chat turn — useful fo
 
 For this internal application, public signup may remain disabled. Create users from Supabase Dashboard > Authentication > Users > Add user, then have them sign in through the frontend.
 
+## Organization access
+
+Users only retrieve documents of organizations they belong to (see [Access Control](../docs/architecture.md#access-control)). After a user has signed in once, grant access from `backend/`:
+
+```powershell
+uv run python scripts/manage_orgs.py create-org amazon "Amazon"
+uv run python scripts/manage_orgs.py add-member an@amazon.com amazon
+uv run python scripts/manage_orgs.py remove-member an@amazon.com amazon
+uv run python scripts/manage_orgs.py list
+```
+
+Documents are assigned to an organization when imported with `../data/ingest_documents.py --org <slug>` (see [data/README.md](../data/README.md)). The smoke scripts search across every organization.
+
 Never add a public user-creation endpoint that exposes the service-role key.
 
 ## Validation

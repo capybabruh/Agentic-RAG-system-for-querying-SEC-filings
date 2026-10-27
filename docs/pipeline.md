@@ -70,7 +70,7 @@ Before an analyst asks a question, the filing corpus must be downloaded and inde
 
 The downloader requests SEC submission metadata for AAPL, MSFT, NVDA, AMZN, and GOOGL. Its defaults select up to five 10-K filings per company whose report year, or filing year when the report date is missing, falls within the previous five calendar years. It saves the original HTML in year folders and writes a manifest containing each filing's identity, dates, original URL, and local path. The current `CLEAR_OUTPUT_DIR=True` setting removes the existing download directory before downloading.
 
-Docling converts the downloaded HTML files into Markdown, preserving the directory layout. Conversion skips output that is already up to date unless `--force` is supplied. A separate importer combines the Markdown with manifest metadata and stores one `source_documents` row per filing. The importer matches existing rows by source URL, skips them by default, and refreshes them when `--update` is supplied.
+Docling converts the downloaded HTML files into Markdown, preserving the directory layout. Conversion skips output that is already up to date unless `--force` is supplied. A separate importer combines the Markdown with manifest metadata and stores one `source_documents` row per filing, owned by the organization named with the required `--org` option (optionally limited to one `--ticker`). It stops before writing if that organization does not exist. The importer matches existing rows by source URL, skips them by default, and refreshes them, including their organization, when `--update` is supplied.
 
 Chunk creation reads the original HTML again through Docling so it can use document structure and provenance. It requires the corresponding source-document row to exist. The default `HybridChunker` splits and merges content using document structure and an approximate 800-token budget. It retains heading context and repeats table headers. The optional hierarchical chunker follows document structure without the hybrid tokenizer budget. There is no fixed sliding-window overlap.
 
@@ -88,6 +88,8 @@ The sidebar requests the signed-in user's conversations. Creating a conversation
 
 Browser API requests attach the Supabase access token as a bearer token. FastAPI verifies it using Supabase Auth, resolves the corresponding application user, and checks thread ownership before returning messages or accepting a question. A missing thread returns 404, another user's thread returns 403, and missing or invalid authentication returns 401.
 
+Which filings a user can search is a separate question from which threads they own. An admin grants organizations to users through `organization_members` (see `backend/scripts/manage_orgs.py`); each turn's retrieval is limited to documents of those organizations.
+
 ### 3. Submit and save the question
 
 When the analyst submits a non-empty question, the chat component clears the input, starts its elapsed-time display, and calls the AI SDK's `sendMessage`. The custom transport sends the thread ID and the current messages' text parts to `POST /chat/stream` using `fetch`. This is a POST request whose response body carries Server-Sent Events (SSE).
@@ -102,7 +104,7 @@ The API starts the chat-turn orchestrator as an asynchronous task. At the same t
 
 While the task is pending, the generator checks for a disconnected client, checks the configured turn deadline, and waits up to half a second for the next status event. After about six seconds without a status event, it emits a "Still working on your answer..." heartbeat. These messages show activity; they do not contain answer text or prove how close generation is to completion.
 
-The orchestrator builds dependencies for this turn: the user and thread IDs, a database session, a retriever, a set of retrieved chunk IDs, a database lock, and the status callback. It runs the PydanticAI agent using the configured Mistral chat model, which defaults to `mistral-small-latest`.
+The orchestrator builds dependencies for this turn: the user and thread IDs, a database session, a retriever, the user's organization IDs looked up from `organization_members`, a set of retrieved chunk IDs, a database lock, and the status callback. It runs the PydanticAI agent using the configured Mistral chat model, which defaults to `mistral-small-latest`.
 
 The agent's instructions ask it to answer from retrieved passages, cite factual claims, provide real excerpts, and acknowledge insufficient evidence. The model decides which tools to call and can gather evidence over multiple tool rounds. The code does not force a fixed first tool or a fixed number of searches.
 
@@ -116,7 +118,9 @@ After both preparations finish, the retriever executes vector search and then fu
 
 Reciprocal Rank Fusion combines the ranked chunk IDs. A chunk receives `1 / (60 + rank)` for each ranking in which it appears, using ranks starting at one. These contributions are summed and sorted; the raw cosine and lexical scores are not added together. The retriever keeps the top ten IDs by default and loads their passage text and filing metadata in that order.
 
-Every passage returned by any tool has its chunk ID added to the turn's retrieved-ID set. This includes neighboring passages. Tool access to the shared database session is serialized with a lock, even if PydanticAI schedules multiple synchronous tools in worker threads. The search filters currently cover ticker and filing type; there is no filing-year filter or user-specific corpus filter in these queries.
+Every passage returned by any tool has its chunk ID added to the turn's retrieved-ID set. This includes neighboring passages. Tool access to the shared database session is serialized with a lock, even if PydanticAI schedules multiple synchronous tools in worker threads. The model-chosen filters cover ticker and filing type; there is no filing-year filter.
+
+Every tool also passes the turn's organization IDs to the retriever, which adds `org_id = ANY(allowed_org_ids)` to both search queries, to passage loading, and to neighbor reads. The model cannot set or see this scope. A user with no organizations gets empty results without any Mistral calls, and documents with no organization are never returned.
 
 ### 6. Generate, validate, and save the answer
 
@@ -172,8 +176,10 @@ HTML + manifest
   +-> data/convert_to_markdown.py::convert_directory()
   |     -> convert_file() -> DocumentConverter.convert()
   |     -> export_to_markdown() -> data/markdown/<year>/<filing>.md
-  |     -> data/ingest_documents.py::ingest_directory()
-  |          -> ingest_filing() -> source_documents
+  |     -> data/ingest_documents.py::ingest_directory(org_slug, ticker?)
+  |          -> select_filings(ticker)
+  |          -> get_org_by_slug() [stop if missing]
+  |          -> ingest_filing(org_id) -> source_documents
   |          -> transaction commit
   |
   +-> data/ingest_chunks.py::main()  [source_documents must already exist]
@@ -269,6 +275,7 @@ deps = DocumentAgentDeps(
     thread_id=str(thread_id),
     db=db,
     retriever=retriever or _default_retriever(),
+    allowed_org_ids=get_user_org_ids(db, user_id),  # from organization_members
     on_status=status_callback,
 )
 result = await document_agent.run(user_message, deps=deps)
@@ -290,23 +297,24 @@ backend/app/assistant/agent.py::document_agent
        |
        +-> search_filings(query, ticker?, filing_type?)
        |     -> acquire deps.db_lock
-       |     -> DocumentRetriever.search()
+       |     -> DocumentRetriever.search(allowed_org_ids=deps.allowed_org_ids)
+       |          -> return [] if allowed_org_ids is empty
        |          -> ThreadPoolExecutor(max_workers=2)
        |               +-> _embed_query(query) -> Mistral embeddings.create()
        |               +-> _fulltext_query(query) -> extract_keywords()
        |          -> wait for both preparation results
-       |          -> queries.vector_search()       [first DB query]
-       |          -> queries.fulltext_search()     [second DB query]
+       |          -> queries.vector_search()       [first DB query, org-scoped]
+       |          -> queries.fulltext_search()     [second DB query, org-scoped]
        |          -> fusion.reciprocal_rank_fusion()[:top_k]
-       |          -> _load_passages() -> SourcePassage[]
+       |          -> _load_passages() -> SourcePassage[] [org-scoped]
        |     -> release lock; _remember(passages)
        |
        +-> read_chunk(chunk_id)
-       |     -> locked retriever.read_surrounding_chunks(window=0)
+       |     -> locked retriever.read_surrounding_chunks(window=0, allowed_org_ids)
        |     -> _remember(); return passage or None
        |
        +-> read_surrounding_chunks(chunk_id, window=1)
-             -> locked retriever.read_surrounding_chunks()
+             -> locked retriever.read_surrounding_chunks(allowed_org_ids)
              -> _remember(); return passages in chunk_index order
   -> model receives tool results and may call tools again
   -> final GroundedAnswer -> orchestrator validation
@@ -373,9 +381,15 @@ users
             -> message_citations.message_id
                  -> document_chunks.id via nullable chunk_id
                       -> source_documents.id via source_document_id
+
+users
+  -> organization_members.user_id
+       -> organizations.id via org_id
+            -> source_documents.org_id
+                 -> document_chunks.source_document_id
 ```
 
-Source documents also have an optional `user_id`, but the ingestion scripts leave it unset and the retrieval queries search the shared corpus. Chat privacy is enforced by the API's user and thread-ownership checks. The checked-in migrations create tables and indexes; they do not enable row-level security or create RLS policies.
+Source documents also have an optional `user_id`, which the ingestion scripts leave unset. Document visibility comes from `source_documents.org_id` and the user's `organization_members` rows; chunks inherit their document's organization. Chat privacy is enforced by the API's user and thread-ownership checks. The checked-in migrations create tables and indexes; they do not enable row-level security or create RLS policies.
 
 | Endpoint | Handler | Purpose |
 | --- | --- | --- |
@@ -414,6 +428,7 @@ These are source-code defaults, not a report of private `.env` values. Backend s
 | Concern | Implementation | Existing verification |
 | --- | --- | --- |
 | Document import and chunk preparation | [ingest_documents.py](../data/ingest_documents.py), [ingest_chunks.py](../data/ingest_chunks.py) | [Ingestion tests](../backend/tests/ingest) |
+| Organizations, membership, document scope | [manage_orgs.py](../backend/scripts/manage_orgs.py), [organizations.py](../backend/app/database/organizations.py), org filters in [Retrieval modules](../backend/app/retrieval) | [Admin CLI tests](../backend/tests/scripts/test_manage_orgs.py), [Retrieval tests](../backend/tests/retrieval), [Agent tests](../backend/tests/assistant/test_agent.py) |
 | Retrieval, filters, keywords, fusion, neighbors | [Retrieval modules](../backend/app/retrieval) | [Retrieval tests](../backend/tests/retrieval) |
 | Tool execution and retrieved-ID tracking | [agent.py](../backend/app/assistant/agent.py), [deps.py](../backend/app/assistant/deps.py) | [Agent tests](../backend/tests/assistant/test_agent.py) |
 | Structured answer and citation validation | [outputs.py](../backend/app/assistant/outputs.py), [validator.py](../backend/app/grounding/validator.py) | [Grounding tests](../backend/tests/grounding/test_validator.py) |
