@@ -10,8 +10,10 @@ Run from backend/ with:
 from __future__ import annotations
 
 from mistralai.client import Mistral
+from sqlalchemy import select
 
 from app.config import settings
+from app.database.models import Organization
 from app.database.session import SessionLocal
 from app.retrieval.retriever import DocumentRetriever
 
@@ -28,10 +30,10 @@ QUERIES = [
 ]
 
 
-def run_one(retriever: DocumentRetriever, db, query: str, ticker: str) -> None:
+def run_one(retriever: DocumentRetriever, db, query: str, ticker: str, org_ids) -> None:
     print("=" * 100)
     print("Q:", query)
-    passages = retriever.search(db, query, top_k=3, ticker=ticker)
+    passages = retriever.search(db, query, top_k=3, ticker=ticker, allowed_org_ids=org_ids)
     if not passages:
         print("  (no passages returned)")
         return
@@ -49,8 +51,10 @@ def main() -> None:
     retriever = DocumentRetriever(client, settings.mistral_embedding_model)
 
     with SessionLocal() as db:
+        # Admin smoke test: search across every organization's documents.
+        org_ids = list(db.scalars(select(Organization.id)))
         for query, ticker in QUERIES:
-            run_one(retriever, db, query, ticker)
+            run_one(retriever, db, query, ticker, org_ids)
 
 
 if __name__ == "__main__":

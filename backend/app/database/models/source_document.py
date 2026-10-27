@@ -11,6 +11,7 @@ from app.database.base import Base
 
 if TYPE_CHECKING:
     from app.database.models.document_chunk import DocumentChunk
+    from app.database.models.organization import Organization
     from app.database.models.user import User
 
 
@@ -25,6 +26,12 @@ class SourceDocument(Base):
     )
     user_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    # NULL means not yet assigned to an organization — retrieval never returns it.
+    org_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"),
         nullable=True,
         index=True,
     )
@@ -53,6 +60,7 @@ class SourceDocument(Base):
     )
 
     user: Mapped["User | None"] = relationship(back_populates="source_documents")
+    organization: Mapped["Organization | None"] = relationship(back_populates="source_documents")
     chunks: Mapped[list["DocumentChunk"]] = relationship(
         back_populates="source_document",
         cascade="all, delete-orphan",

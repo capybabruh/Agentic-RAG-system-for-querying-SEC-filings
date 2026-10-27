@@ -1,7 +1,13 @@
-"""Query-to-source-passage retrieval: embed, run hybrid search, fuse, hydrate rows."""
+"""Query-to-source-passage retrieval: embed, run hybrid search, fuse, hydrate rows.
+
+Every public method takes `allowed_org_ids` and only ever returns chunks from
+documents owned by those organizations. The caller (the agent's deps) supplies
+it from the authenticated user's memberships — never from model output.
+"""
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -73,15 +79,21 @@ class DocumentRetriever:
         return extract_keywords(self._client, self._chat_model, query)
 
     def _load_passages(
-        self, db: Session, ordered_scores: list[tuple[uuid.UUID, float]]
+        self,
+        db: Session,
+        ordered_scores: list[tuple[uuid.UUID, float]],
+        allowed_org_ids: Sequence[uuid.UUID],
     ) -> list[SourcePassage]:
-        if not ordered_scores:
+        if not ordered_scores or not allowed_org_ids:
             return []
         chunk_ids = [chunk_id for chunk_id, _ in ordered_scores]
         rows = db.execute(
             select(DocumentChunk, SourceDocument)
             .join(SourceDocument, DocumentChunk.source_document_id == SourceDocument.id)
-            .where(DocumentChunk.id.in_(chunk_ids))
+            .where(
+                DocumentChunk.id.in_(chunk_ids),
+                SourceDocument.org_id.in_(allowed_org_ids),
+            )
         ).all()
         rows_by_id = {chunk.id: (chunk, document) for chunk, document in rows}
         passages = []
@@ -101,7 +113,13 @@ class DocumentRetriever:
         candidate_k: int = settings.retrieval_candidate_k,
         ticker: str | None = None,
         filing_type: str | None = None,
+        *,
+        allowed_org_ids: Sequence[uuid.UUID],
     ) -> list[SourcePassage]:
+        # A user with no organizations can read nothing — skip the Mistral calls entirely.
+        if not allowed_org_ids:
+            return []
+
         # _embed_query and _fulltext_query are both independent Mistral network calls on the
         # same raw query — run them concurrently rather than paying their durations serially.
         with ThreadPoolExecutor(max_workers=2) as executor:
@@ -110,8 +128,12 @@ class DocumentRetriever:
             query_embedding = embedding_future.result()
             fulltext_query = fulltext_future.result()
 
-        vector_results = vector_search(db, query_embedding, candidate_k, ticker, filing_type)
-        text_results = fulltext_search(db, fulltext_query, candidate_k, ticker, filing_type)
+        vector_results = vector_search(
+            db, query_embedding, candidate_k, ticker, filing_type, allowed_org_ids=allowed_org_ids
+        )
+        text_results = fulltext_search(
+            db, fulltext_query, candidate_k, ticker, filing_type, allowed_org_ids=allowed_org_ids
+        )
 
         fused = reciprocal_rank_fusion(
             [
@@ -119,11 +141,20 @@ class DocumentRetriever:
                 [result.chunk_id for result in text_results],
             ]
         )[:top_k]
-        return self._load_passages(db, fused)
+        return self._load_passages(db, fused, allowed_org_ids)
 
     def read_surrounding_chunks(
-        self, db: Session, chunk_id: uuid.UUID, window: int = settings.retrieval_neighbor_window
+        self,
+        db: Session,
+        chunk_id: uuid.UUID,
+        window: int = settings.retrieval_neighbor_window,
+        *,
+        allowed_org_ids: Sequence[uuid.UUID],
     ) -> list[SourcePassage]:
+        # chunk_id comes from the model, so it may name a chunk in another organization;
+        # the org filter below makes such a chunk (and its neighbors) simply not found.
+        if not allowed_org_ids:
+            return []
         target = db.get(DocumentChunk, chunk_id)
         if target is None:
             return []
@@ -133,6 +164,7 @@ class DocumentRetriever:
             .join(SourceDocument, DocumentChunk.source_document_id == SourceDocument.id)
             .where(
                 DocumentChunk.source_document_id == target.source_document_id,
+                SourceDocument.org_id.in_(allowed_org_ids),
                 DocumentChunk.chunk_index >= target.chunk_index - window,
                 DocumentChunk.chunk_index <= target.chunk_index + window,
             )

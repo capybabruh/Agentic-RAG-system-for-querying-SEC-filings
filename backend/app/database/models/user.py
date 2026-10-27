@@ -11,6 +11,7 @@ from app.database.base import Base
 
 if TYPE_CHECKING:
     from app.database.models.chat_thread import ChatThread
+    from app.database.models.organization_member import OrganizationMember
     from app.database.models.source_document import SourceDocument
 
 
@@ -43,6 +44,10 @@ class User(Base):
         cascade="all, delete-orphan",
     )
     chat_threads: Mapped[list["ChatThread"]] = relationship(
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
+    organization_memberships: Mapped[list["OrganizationMember"]] = relationship(
         back_populates="user",
         cascade="all, delete-orphan",
     )
